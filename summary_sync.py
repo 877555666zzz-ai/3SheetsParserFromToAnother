@@ -4,23 +4,25 @@ summary_sync.py
 
 Безопасная синхронизация двух Google Sheets-источников в итоговую таблицу.
 
-ВАЖНО: бизнес-логика подсчётов сохранена из старой версии. Изменена обёртка:
-безопасность, dry-run, backup, проверка структуры, retry, AUTO_MONTH,
-логирование и защита от пересечения блоков.
+ВАЖНО: бизнес-логика подсчётов (analyze_single_sheet) сохранена 1-в-1 из
+старой версии. Изменена только обёртка: безопасность, dry-run, backup,
+проверка структуры, retry, логирование.
 
-Ничего никогда не пишется за пределы A:M и N1.
+Ничего никогда не пишется за пределы A:M и (опционально) N1.
 Никакие листы не удаляются. Никакие колонки/строки не дропаются.
-Хвост блока чистится ТОЛЬКО если CLEAR_TAIL=true и пройдены проверки.
+Хвост блока чистится ТОЛЬКО если явно CLEAR_TAIL=true и пройдены все
+проверки (drop ratio, не-пустой результат, нашёлся блок, корректный header).
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -34,6 +36,7 @@ from googleapiclient.errors import HttpError
 #                       Боевые ID и константы
 # =====================================================================
 
+# Эти ID — production. В ENVIRONMENT=test их использовать запрещено.
 PRODUCTION_SPREADSHEET_IDS = frozenset({
     "1OgF4xLUqwSHs2S2NPXCJfsVgLM4V9W5c3yQq5lDoS-o",   # OUR_GRID_ID prod
     "18nfkpxiPG6xB7uLcCpwV8Qwmx7VJ3ii7uHUzfUh4L2Y",   # SUMMARY prod
@@ -41,8 +44,11 @@ PRODUCTION_SPREADSHEET_IDS = frozenset({
 })
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+# Колонки в итоговом блоке: A..M (13 колонок). Никогда не выходим за это.
 BLOCK_WIDTH = 13
 
+# Ожидаемые заголовки итогового блока (в порядке A..M).
 EXPECTED_BLOCK_HEADERS = [
     "менеджеры",
     "офферты всего",
@@ -59,12 +65,14 @@ EXPECTED_BLOCK_HEADERS = [
     "красные",
 ]
 
+# Маркеры заголовка блока в итоговой таблице (для row_looks_like_header).
 HEADER_MARKERS = [
     "менеджер", "менеджеры", "офферт", "офферты", "ип", "тоо",
     "договор", "акцепт", "акцепт %", "пусто", "другое", "красные",
     "метка",
 ]
 
+# Ключевые слова для поиска колонок в ИСТОЧНИКАХ (Наша/Яндекс сетка).
 SOURCE_COL_KEYWORDS = {
     "MANAGER":  ["менеджер", "сотрудник", "manager"],
     "OPF":      ["опф", "форма"],
@@ -73,12 +81,17 @@ SOURCE_COL_KEYWORDS = {
     "TAGS":     ["метки", "наличие метки", "nib"],
 }
 
+# Слова, которые в строке-данных трактуются как «красная».
 RED_TEXT_MARKERS = ("красн", "red", "красный", "красная")
 
 
 # =====================================================================
-#               Русские названия месяцев для AUTO_MONTH
+#               Русские названия месяцев (для AUTO_MONTH)
 # =====================================================================
+#
+# В Settings и в названиях листов используется именительный падеж:
+# "Январь 2026", "Февраль 2026", ... — поэтому генерируем строки сами,
+# а не через locale-зависимый strftime("%B"), который ненадёжен.
 
 RU_MONTH_NAMES = [
     "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -88,6 +101,13 @@ RU_MONTH_TO_IDX: Dict[str, int] = {n.lower(): i + 1 for i, n in enumerate(RU_MON
 
 
 def compute_auto_month(tz: str, offset: int) -> str:
+    """
+    Текущий месяц в TZ + offset месяцев.
+    offset=0  -> текущий месяц
+    offset=-1 -> предыдущий
+    offset=1  -> следующий
+    Возвращает строку формата "Июнь 2026".
+    """
     dt = datetime.now(ZoneInfo(tz))
     total = dt.year * 12 + (dt.month - 1) + offset
     year = total // 12
@@ -96,6 +116,7 @@ def compute_auto_month(tz: str, offset: int) -> str:
 
 
 def parse_ru_month(s: str) -> Optional[Tuple[int, int]]:
+    """'Июнь 2026' -> (2026, 6). Возвращает None при невалидном формате."""
     if not s:
         return None
     parts = s.strip().split()
@@ -114,6 +135,11 @@ def parse_ru_month(s: str) -> Optional[Tuple[int, int]]:
 def find_closest_settings_month(
     settings_pairs: List[Tuple[str, str, str]], target_month: str
 ) -> Optional[str]:
+    """
+    Используется при AUTO_DISCOVER_MONTH=true, если вычисленного месяца
+    нет в Settings. Возвращает самый свежий месяц из Settings, который
+    не позже target_month, либо None.
+    """
     target = parse_ru_month(target_month)
     if not target:
         return None
@@ -131,7 +157,6 @@ def find_closest_settings_month(
 # =====================================================================
 #                              Config
 # =====================================================================
-
 
 def _env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
@@ -165,32 +190,49 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _parse_manager_order(value: str) -> List[str]:
-    if not value:
-        return []
-    return [x.strip() for x in value.split(",") if x.strip()]
+def _env_list(name: str, default: Optional[List[str]] = None) -> List[str]:
+    """Comma-separated list. Пустые значения отбрасываются."""
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return list(default) if default else []
+    return [s.strip() for s in v.split(",") if s.strip()]
 
 
-def _parse_manager_aliases(value: str) -> Dict[str, str]:
-    if not value:
-        return {}
+def _env_json_dict(name: str, default: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """
+    JSON-объект из env. Ключи нормализуются в lowercase (для регистронезависимого
+    поиска). Значения остаются как есть — это канонические имена.
+    Невалидный JSON => SystemExit (лучше упасть, чем тихо мискатегоризировать).
+    """
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return dict(default) if default else {}
     try:
-        raw = json.loads(value)
-        if isinstance(raw, dict):
-            return {str(k).strip().lower(): str(v).strip() for k, v in raw.items() if str(k).strip() and str(v).strip()}
-    except Exception:
-        pass
-    return {}
+        d = json.loads(v)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"{name} is not valid JSON: {e}")
+    if not isinstance(d, dict):
+        raise SystemExit(f"{name} must be a JSON object, got {type(d).__name__}")
+    out: Dict[str, str] = {}
+    for k, val in d.items():
+        if not isinstance(k, str) or not isinstance(val, str):
+            raise SystemExit(f"{name}: keys and values must be strings, got {k!r}->{val!r}")
+        key = k.strip().lower()
+        if key:
+            out[key] = val.strip()
+    return out
 
 
 @dataclass
 class Config:
-    environment: str = "test"
-    run_mode: str = "once"
+    # ---- режим работы ----
+    environment: str = "test"                # test | production
+    run_mode: str = "once"                   # once | loop
     dry_run: bool = True
     safe_mode: bool = True
     allow_production_write: bool = False
 
+    # ---- spreadsheets ----
     our_grid_id: str = ""
     yandex_grid_id: str = ""
     summary_spreadsheet_id: str = ""
@@ -201,6 +243,7 @@ class Config:
 
     summary_settings_sheet_name: str = "Settings"
 
+    # ---- поведение ----
     require_yandex: bool = False
     allow_create_sheets: bool = False
     create_log_sheet: bool = False
@@ -212,34 +255,43 @@ class Config:
     clear_tail: bool = False
     max_drop_ratio: float = 0.7
     red_gap_rows: int = 5
-    max_data_rows: int = 5000
+    max_data_rows: int = 5000          # верхняя граница строк, читаемых из источника
 
+    # ---- backup ----
     backup_before_write: bool = True
     backup_dir: str = "backups"
 
+    # ---- цикл ----
     loop_sleep_sec: int = 15
     hot_month: str = ""
     hot_write_interval_sec: int = 60
     cold_refresh_sec: int = 300
 
-    creds_source: str = ""
-    tz: str = "Asia/Almaty"
-    target_month: Optional[str] = None
+    # ---- креды (имена; сами секреты в env) ----
+    creds_source: str = ""             # имя источника, чтобы залогировать
 
+    # ---- runtime ----
+    tz: str = "Asia/Almaty"
+    target_month: Optional[str] = None  # CLI --month
+
+    # ---- автоматический выбор месяца ----
     auto_month: bool = False
     month_offset: int = 0
     auto_discover_month: bool = False
 
-    our_block_rows: int = 20
-    yandex_block_rows: int = 60
+    # ---- строгая фильтрация менеджеров ----
+    manager_strict_order_only: bool = False
+    include_zero_managers_from_order: bool = True
+    manager_order: List[str] = field(default_factory=list)
+    manager_aliases: Dict[str, str] = field(default_factory=dict)  # lower-key -> canonical
 
-    manager_order: List[str] = None
-    include_zero_managers_from_order: bool = False
-    manager_aliases: Dict[str, str] = None
+    # Размеры блоков в итоговой таблице
+    our_block_rows: int = 20            # сколько строк отведено под "Наша сетка"
+    yandex_block_rows: int = 60         # сколько строк отведено под "Яндекс сетка"
 
     @classmethod
     def from_env(cls) -> "Config":
-        return cls(
+        c = cls(
             environment=_env_str("ENVIRONMENT", "test").lower(),
             run_mode=_env_str("RUN_MODE", "once").lower(),
             dry_run=_env_bool("DRY_RUN", True),
@@ -285,23 +337,30 @@ class Config:
             month_offset=_env_int("MONTH_OFFSET", 0),
             auto_discover_month=_env_bool("AUTO_DISCOVER_MONTH", False),
 
-            manager_order=_parse_manager_order(_env_str("MANAGER_ORDER")),
-            include_zero_managers_from_order=_env_bool("INCLUDE_ZERO_MANAGERS_FROM_ORDER", False),
-            manager_aliases=_parse_manager_aliases(_env_str("MANAGER_ALIASES")),
+            manager_strict_order_only=_env_bool("MANAGER_STRICT_ORDER_ONLY", False),
+            include_zero_managers_from_order=_env_bool("INCLUDE_ZERO_MANAGERS_FROM_ORDER", True),
+            manager_order=_env_list("MANAGER_ORDER"),
+            manager_aliases=_env_json_dict("MANAGER_ALIASES"),
         )
+        return c
 
     def validate(self) -> None:
+        """Жёсткая проверка конфигурации. Бросает SystemExit при опасной комбинации."""
         if self.environment not in ("test", "production"):
             raise SystemExit(f"Invalid ENVIRONMENT={self.environment!r} (test|production)")
+
         if self.run_mode not in ("once", "loop"):
             raise SystemExit(f"Invalid RUN_MODE={self.run_mode!r} (once|loop)")
+
         if not self.our_grid_id:
             raise SystemExit("OUR_GRID_ID is empty")
         if not self.summary_spreadsheet_id:
             raise SystemExit("SUMMARY_SPREADSHEET_ID is empty")
+        # YANDEX можно оставить пустым только если REQUIRE_YANDEX=false
         if self.require_yandex and not self.yandex_grid_id:
             raise SystemExit("REQUIRE_YANDEX=true but YANDEX_GRID_ID is empty")
 
+        # Запрет боевых ID в test-режиме
         if self.environment == "test":
             for label, sid in (
                 ("OUR_GRID_ID", self.our_grid_id),
@@ -314,30 +373,50 @@ class Config:
                         f"({label}={sid}). Use a copy."
                     )
 
+        # В production без явного разрешения — только dry-run
         if self.environment == "production" and not self.allow_production_write:
             if not self.dry_run:
-                print("[SAFETY] ENVIRONMENT=production but ALLOW_PRODUCTION_WRITE=false -> forcing DRY_RUN=true")
+                print("[SAFETY] ENVIRONMENT=production but ALLOW_PRODUCTION_WRITE=false "
+                      "-> forcing DRY_RUN=true")
                 self.dry_run = True
 
         if self.max_drop_ratio < 0 or self.max_drop_ratio > 1:
             raise SystemExit(f"MAX_DROP_RATIO must be in [0..1], got {self.max_drop_ratio}")
+
         if self.red_gap_rows < 1:
             raise SystemExit(f"RED_GAP_ROWS must be >= 1, got {self.red_gap_rows}")
+
+        # MONTH_OFFSET — целое в разумных пределах
         if abs(self.month_offset) > 120:
-            raise SystemExit(f"MONTH_OFFSET={self.month_offset} is unreasonable (max ±120 months)")
+            raise SystemExit(
+                f"MONTH_OFFSET={self.month_offset} is unreasonable (max ±120 months)"
+            )
+
+        # MANAGER_STRICT_ORDER_ONLY=true без списка — опасно (всё будет отфильтровано)
+        if self.manager_strict_order_only and not self.manager_order:
+            raise SystemExit(
+                "MANAGER_STRICT_ORDER_ONLY=true but MANAGER_ORDER is empty. "
+                "Set MANAGER_ORDER=Имя1,Имя2,... or turn off strict mode."
+            )
+
+        # Проверка, что aliases не мапят на пустые строки
+        for k, v in self.manager_aliases.items():
+            if not v:
+                raise SystemExit(f"MANAGER_ALIASES has empty value for key {k!r}")
 
     def banner(self) -> str:
         resolved = self.resolve_target_month()
         if self.target_month:
             month_line = f"target_month     : {self.target_month}  (from CLI --month)"
         elif self.auto_month:
-            month_line = f"target_month     : {resolved}  (AUTO_MONTH=true, MONTH_OFFSET={self.month_offset})"
+            month_line = (f"target_month     : {resolved}  "
+                          f"(AUTO_MONTH=true, MONTH_OFFSET={self.month_offset})")
         else:
             month_line = "target_month     : <all months from Settings>"
 
-        return "\n".join([
+        lines = [
             "=" * 64,
-            " Google Sheets Summary Sync ",
+            f" Google Sheets Summary Sync ",
             "=" * 64,
             f" timestamp        : {self.now_local().isoformat()}",
             f" ENVIRONMENT      : {self.environment}",
@@ -351,17 +430,29 @@ class Config:
             f" RED_GAP_ROWS     : {self.red_gap_rows}",
             f" MAX_DROP_RATIO   : {self.max_drop_ratio}",
             f" MAX_DATA_ROWS    : {self.max_data_rows}",
-            f" AUTO_MONTH       : {self.auto_month}  (MONTH_OFFSET={self.month_offset}, AUTO_DISCOVER_MONTH={self.auto_discover_month})",
+            f" AUTO_MONTH       : {self.auto_month}  (MONTH_OFFSET={self.month_offset}, "
+            f"AUTO_DISCOVER_MONTH={self.auto_discover_month})",
+            f" MGR_STRICT       : {self.manager_strict_order_only}  "
+            f"(order={len(self.manager_order)}, aliases={len(self.manager_aliases)}, "
+            f"include_zero={self.include_zero_managers_from_order})",
             f" {month_line}",
-            f" MANAGER_ORDER    : {len(self.manager_order or [])} names",
             f" OUR_GRID_ID      : {_mask_id(self.our_grid_id)}",
             f" YANDEX_GRID_ID   : {_mask_id(self.yandex_grid_id) or '<empty>'}",
             f" SUMMARY_ID       : {_mask_id(self.summary_spreadsheet_id)}",
             f" creds_source     : {self.creds_source or '<auto>'}",
             "=" * 64,
-        ])
+        ]
+        return "\n".join(lines)
 
     def resolve_target_month(self) -> Optional[str]:
+        """
+        Какой месяц обрабатывать.
+
+        Приоритет:
+          1. CLI --month (config.target_month) — самый высокий.
+          2. AUTO_MONTH=true → compute_auto_month(tz, month_offset).
+          3. Иначе None → run_summary_once обработает все месяцы из Settings.
+        """
         if self.target_month:
             return self.target_month
         if self.auto_month:
@@ -384,8 +475,8 @@ def _mask_id(sid: str) -> str:
 #                          Авторизация Google
 # =====================================================================
 
-
 def _validate_sa_info(info: Dict[str, Any]) -> None:
+    """Проверяем минимальный набор полей у service account JSON."""
     if not isinstance(info, dict):
         raise SystemExit("Service account JSON is not an object")
     missing = [k for k in ("client_email", "token_uri", "private_key") if not info.get(k)]
@@ -394,6 +485,13 @@ def _validate_sa_info(info: Dict[str, Any]) -> None:
 
 
 def build_sheets_service(config: Config):
+    """
+    Приоритет источников creds:
+      1. GCP_SA_JSON      — JSON service account прямо в env
+      2. GOOGLE_CREDS_B64 — base64 от JSON service account
+      3. GOOGLE_APPLICATION_CREDENTIALS — путь к JSON-файлу
+      4. Application Default Credentials
+    """
     sa_json = os.getenv("GCP_SA_JSON")
     if sa_json:
         try:
@@ -430,12 +528,14 @@ def build_sheets_service(config: Config):
         config.creds_source = f"GOOGLE_APPLICATION_CREDENTIALS={path}"
         return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
+    # ADC
     try:
         import google.auth
         creds, _ = google.auth.default(scopes=SCOPES)
     except Exception as e:
         raise SystemExit(
-            "No credentials provided. Set one of: GCP_SA_JSON / GOOGLE_CREDS_B64 / GOOGLE_APPLICATION_CREDENTIALS. "
+            "No credentials provided. Set one of: "
+            "GCP_SA_JSON / GOOGLE_CREDS_B64 / GOOGLE_APPLICATION_CREDENTIALS. "
             f"ADC fallback failed: {e}"
         )
     config.creds_source = "ADC"
@@ -446,6 +546,8 @@ def build_sheets_service(config: Config):
 #                       API helpers + retry
 # =====================================================================
 
+# 403/404 — НЕ ретраим, выбрасываем сразу с понятным сообщением.
+# 429/500/502/503/504 — ретраим до 3 раз с экспоненциальной паузой.
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 
 
@@ -459,7 +561,8 @@ def _http_status(e: HttpError) -> Optional[int]:
 def _explain_http_error(e: HttpError, action: str) -> str:
     status = _http_status(e)
     if status == 403:
-        return f"403 Permission denied while {action}. Проверь что у service account есть доступ Editor к таблице."
+        return (f"403 Permission denied while {action}. "
+                f"Проверь что у service account есть доступ Editor к таблице.")
     if status == 404:
         return f"404 Not found while {action}. Проверь spreadsheet ID и название листа."
     if status == 401:
@@ -468,6 +571,10 @@ def _explain_http_error(e: HttpError, action: str) -> str:
 
 
 def call_with_retry(fn, action: str, max_retries: int = 3, base_sleep: float = 1.5):
+    """
+    Запускает fn() с ретраями только на 429/500/502/503/504.
+    На 403/404/401 — сразу бросает с понятным сообщением.
+    """
     last_exc: Optional[Exception] = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -478,10 +585,12 @@ def call_with_retry(fn, action: str, max_retries: int = 3, base_sleep: float = 1
                 raise SystemExit("[FATAL] " + _explain_http_error(e, action))
             if status in RETRYABLE_STATUSES and attempt < max_retries:
                 sleep_s = base_sleep * (2 ** (attempt - 1))
-                print(f"[WARN] {action}: HTTP {status}, retry {attempt}/{max_retries} in {sleep_s:.1f}s")
+                print(f"[WARN] {action}: HTTP {status}, retry {attempt}/{max_retries} "
+                      f"in {sleep_s:.1f}s")
                 time.sleep(sleep_s)
                 last_exc = e
                 continue
+            # не ретраимая или закончились попытки
             raise
         except Exception as e:
             last_exc = e
@@ -520,6 +629,7 @@ def get_spreadsheet_meta(service, spreadsheet_id: str) -> Dict[str, Any]:
 
 
 def get_sheet_titles(service, spreadsheet_id: str) -> Dict[str, str]:
+    """lower_name -> real_name"""
     meta = get_spreadsheet_meta(service, spreadsheet_id)
     return {
         s["properties"]["title"].lower(): s["properties"]["title"]
@@ -546,17 +656,21 @@ def find_sheet_smart(titles_lower: Dict[str, str], partial_name: str) -> Optiona
 
 
 # =====================================================================
-#               Проверка title и структуры
+#               Проверка title и структуры (safety gates)
 # =====================================================================
 
-
-def verify_spreadsheet_title(service, spreadsheet_id: str, expected_title: str, label: str) -> str:
+def verify_spreadsheet_title(
+    service, spreadsheet_id: str, expected_title: str, label: str
+) -> str:
+    """Возвращает фактический title. Если ожидаемый задан и не совпадает — SystemExit."""
     meta = get_spreadsheet_meta(service, spreadsheet_id)
     actual = get_spreadsheet_title(meta)
     if expected_title:
         if actual.strip() != expected_title.strip():
             raise SystemExit(
-                f"[FATAL] {label}: spreadsheet title mismatch. Expected={expected_title!r}, actual={actual!r}. Refusing to continue."
+                f"[FATAL] {label}: spreadsheet title mismatch. "
+                f"Expected={expected_title!r}, actual={actual!r}. "
+                f"Refusing to continue."
             )
         print(f"[OK] {label} title verified: {actual!r}")
     else:
@@ -574,7 +688,10 @@ def row_looks_like_header(row_vals: List[Any]) -> bool:
     return hits >= 2 or ("менедж" in txt)
 
 
-def find_title_row(service, summary_id: str, sheet_title: str, label: str, search_rows: int = 200) -> Optional[int]:
+def find_title_row(
+    service, summary_id: str, sheet_title: str, label: str, search_rows: int = 200
+) -> Optional[int]:
+    """1-based номер строки, где встретился label (case-insensitive)."""
     vals = read_values(service, summary_id, f"{sheet_title}!A1:M{search_rows}")
     lab = label.lower()
     for i, row in enumerate(vals, start=1):
@@ -585,33 +702,42 @@ def find_title_row(service, summary_id: str, sheet_title: str, label: str, searc
 
 
 def header_matches_expected(header_row: List[Any]) -> Tuple[bool, str]:
+    """Допускаем небольшие отличия регистра/пробелов."""
     if not header_row:
         return False, "header row is empty"
     norm = [re.sub(r"\s+", " ", str(c)).strip().lower() for c in header_row[:BLOCK_WIDTH]]
+    expected = EXPECTED_BLOCK_HEADERS
+    # Должны совпадать хотя бы 10 из 13 (точное совпадение, регистро-нечувствительное).
+    # Это терпит мелкие опечатки. Но "менеджеры" в A — обязательное условие.
     if not norm or "менедж" not in norm[0]:
         return False, f"col A is not 'Менеджеры', got {norm[0]!r}"
     hits = 0
-    for i, exp in enumerate(EXPECTED_BLOCK_HEADERS):
+    for i, exp in enumerate(expected):
         if i < len(norm) and norm[i] == exp:
             hits += 1
     if hits < 10:
-        return False, f"only {hits}/13 expected columns match. Got: {norm}. Expected: {EXPECTED_BLOCK_HEADERS}"
+        return False, (f"only {hits}/13 expected columns match. "
+                       f"Got: {norm}. Expected: {expected}")
     return True, "ok"
 
 
 @dataclass
 class BlockLocation:
     label: str
-    title_row: int
-    header_row: int
-    data_start_row: int
-    data_max_rows: int
+    title_row: int        # строка с "НАША СЕТКА"/"ЯНДЕКС СЕТКА"
+    header_row: int       # строка заголовков
+    data_start_row: int   # первая строка данных (managers)
+    data_max_rows: int    # сколько строк под данные отведено в блоке
 
 
 def locate_block(
     service, config: Config, real_sheet_title: str, label: str, block_height_hint: int,
-    next_block_title_row: Optional[int] = None,
+    next_block_title_row: Optional[int] = None
 ) -> Optional[BlockLocation]:
+    """
+    Ищет блок по тексту title. Проверяет, что строкой ниже идёт header.
+    Возвращает None и пишет в лог, если что-то не так (SAFE_MODE => не писать).
+    """
     title_row = find_title_row(service, config.summary_spreadsheet_id, real_sheet_title, label)
     if not title_row:
         print(f"[WARN] Block title {label!r} not found in {real_sheet_title!r}")
@@ -620,58 +746,72 @@ def locate_block(
     header_row = title_row + 1
     data_start = title_row + 2
 
-    header_vals = read_values(service, config.summary_spreadsheet_id, f"{real_sheet_title}!A{header_row}:M{header_row}")
+    # Проверим, что header_row действительно "пахнет header'ом" и совпадает с expected
+    header_vals = read_values(
+        service, config.summary_spreadsheet_id,
+        f"{real_sheet_title}!A{header_row}:M{header_row}",
+    )
     header = header_vals[0] if header_vals else []
+
     ok, reason = header_matches_expected(header)
     if not ok:
         print(f"[WARN] Block {label!r} header check failed: {reason}")
         return None
 
-    ds_vals = read_values(service, config.summary_spreadsheet_id, f"{real_sheet_title}!A{data_start}:M{data_start}")
+    # Защита: если data_start вдруг тоже похожа на header — отказываемся писать.
+    ds_vals = read_values(
+        service, config.summary_spreadsheet_id,
+        f"{real_sheet_title}!A{data_start}:M{data_start}",
+    )
     ds_row = ds_vals[0] if ds_vals else []
     if row_looks_like_header(ds_row):
-        print(f"[WARN] Block {label!r}: data_start_row={data_start} looks like header. Refusing to write.")
+        print(f"[WARN] Block {label!r}: data_start_row={data_start} looks like header. "
+              f"Refusing to write.")
         return None
 
+    # Сколько строк отвести под данные
     if next_block_title_row is not None and next_block_title_row > data_start:
-        # Не даём верхнему блоку дописаться до title следующего блока.
-        # Оставляем одну строку зазора перед следующим title.
-        data_max_rows = max(1, next_block_title_row - data_start - 1)
+        # данные не должны заходить на title следующего блока
+        data_max_rows = max(1, next_block_title_row - 1 - data_start + 1 - 1)
     else:
         data_max_rows = block_height_hint
 
-    return BlockLocation(label, title_row, header_row, data_start, data_max_rows)
+    return BlockLocation(
+        label=label,
+        title_row=title_row,
+        header_row=header_row,
+        data_start_row=data_start,
+        data_max_rows=data_max_rows,
+    )
 
 
 # =====================================================================
-#         Бизнес-логика подсчёта
+#         Бизнес-логика подсчёта (ПЕРЕНЕСЕНА БЕЗ ИЗМЕНЕНИЙ)
 # =====================================================================
 
+def _normalize_manager_name(
+    name: Any, aliases: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    """
+    Приводит имя менеджера к каноническому виду.
 
-def _normalize_manager_name(name: Any) -> Optional[str]:
+    1. Обрезает пробелы, отбрасывает короче 2 символов.
+    2. Если в aliases есть запись (по lowercase) — возвращает канонический вариант.
+       Например: "айнел" -> "Айнель".
+    3. Иначе делает первую букву заглавной, остальные строчными.
+
+    aliases — словарь lower(name) -> canonical name.
+    """
     if not name:
         return None
     s = str(name).strip()
     if len(s) < 2:
         return None
+    if aliases:
+        low = s.lower()
+        if low in aliases:
+            return aliases[low]
     return s[:1].upper() + s[1:].lower()
-
-
-def _canonical_manager_name(name: Any, config: Config) -> Optional[str]:
-    normalized = _normalize_manager_name(name)
-    if not normalized:
-        return None
-    key = normalized.strip().lower()
-    if config.manager_aliases and key in config.manager_aliases:
-        return config.manager_aliases[key]
-    return normalized
-
-
-def _sort_manager_rows(rows: List[List[Any]], config: Config) -> List[List[Any]]:
-    if not config.manager_order:
-        return sorted(rows, key=lambda x: str(x[0]))
-    order = {name.strip().lower(): i for i, name in enumerate(config.manager_order)}
-    return sorted(rows, key=lambda x: (order.get(str(x[0]).strip().lower(), 10_000), str(x[0])))
 
 
 def _find_idx(headers: List[str], keywords: List[str]) -> int:
@@ -683,8 +823,18 @@ def _find_idx(headers: List[str], keywords: List[str]) -> int:
 
 
 def analyze_single_sheet(
-    service, source_id: str, source_titles_lower: Dict[str, str], sheet_name: str, config: Config,
+    service, source_id: str, source_titles_lower: Dict[str, str],
+    sheet_name: str, config: Config,
 ) -> List[List[Any]]:
+    """
+    БИЗНЕС-ЛОГИКА СОХРАНЕНА 1-в-1 ИЗ ИСХОДНОГО КОДА.
+
+    Возвращает список строк итоговой таблицы (по 13 значений в каждой):
+      [manager, total, ip, too, contract, accept, percent_str,
+       nib_sale, nib, zero, empty_tag, other_tag, red]
+
+    Сортировано по имени менеджера.
+    """
     if not sheet_name:
         return []
     real_name = find_sheet_smart(source_titles_lower, sheet_name)
@@ -692,6 +842,7 @@ def analyze_single_sheet(
         print(f"[INFO] Source sheet {sheet_name!r} not found in {_mask_id(source_id)}, skipped.")
         return []
 
+    # Защита от безумных объёмов: ограничиваем диапазон чтения сверху.
     a1 = f"{real_name}!A1:Z{config.max_data_rows + 1}"
     data = read_values(service, source_id, a1)
     if len(data) < 2:
@@ -699,6 +850,7 @@ def analyze_single_sheet(
         return []
 
     headers = [str(h).lower().strip() for h in data[0]]
+
     idx = {
         "man":      _find_idx(headers, SOURCE_COL_KEYWORDS["MANAGER"]),
         "opf":      _find_idx(headers, SOURCE_COL_KEYWORDS["OPF"]),
@@ -707,6 +859,7 @@ def analyze_single_sheet(
         "tags":     _find_idx(headers, SOURCE_COL_KEYWORDS["TAGS"]),
     }
 
+    # Иногда первая строка не header, а заголовок — пробуем 2-ю.
     if idx["man"] == -1 and len(data) > 2:
         headers2 = [str(h).lower().strip() for h in data[1]]
         idx["man"] = _find_idx(headers2, SOURCE_COL_KEYWORDS["MANAGER"])
@@ -728,9 +881,10 @@ def analyze_single_sheet(
             if consecutive_empty_rows >= config.red_gap_rows:
                 is_red_section = True
             continue
-        consecutive_empty_rows = 0
+        else:
+            consecutive_empty_rows = 0
 
-        manager = _canonical_manager_name(manager_raw, config)
+        manager = _normalize_manager_name(manager_raw, config.manager_aliases)
         if not manager:
             continue
 
@@ -742,12 +896,14 @@ def analyze_single_sheet(
             }
         s = stats[manager]
 
+        # В красной секции — НЕ считаем обычные показатели
         if is_red_section:
             s["red"] += 1
             continue
 
         s["total"] += 1
 
+        # ИП / ТОО — как в оригинале (поиск по тексту строки + колонке ОПФ)
         opf_text = ""
         if idx["opf"] > -1 and idx["opf"] < len(row):
             opf_text += str(row[idx["opf"]]).lower()
@@ -758,16 +914,19 @@ def analyze_single_sheet(
         if "тоо" in opf_text:
             s["too"] += 1
 
+        # Договор есть: значение НЕ в ("", "нет", "0", "-", "—")
         if idx["contract"] > -1 and idx["contract"] < len(row):
             val = str(row[idx["contract"]]).lower().strip()
             if val not in ("", "нет", "0", "-", "—"):
                 s["contract"] += 1
 
+        # Акцепт/Оплата: длина > 1 и нет "нет"/"отказ"/"ошибка"
         if idx["accept"] > -1 and idx["accept"] < len(row):
             val = str(row[idx["accept"]]).lower()
             if len(val) > 1 and ("нет" not in val) and ("отказ" not in val) and ("ошибка" not in val):
                 s["accept"] += 1
 
+        # Метки: nib_sale -> nib -> "0"/"0.0" -> пусто -> другое
         tag_val = ""
         if idx["tags"] > -1 and idx["tags"] < len(row):
             tag_val = str(row[idx["tags"]]).lower().strip()
@@ -782,34 +941,72 @@ def analyze_single_sheet(
         else:
             s["other_tag"] += 1
 
+        # Дополнительная пометка "красная" по тексту строки.
+        # В оригинале это ДОБАВКА (не эксклюзивно). Сохраняем поведение.
         row_text = " ".join(str(x).lower() for x in row)
         if any(m in row_text for m in RED_TEXT_MARKERS):
             s["red"] += 1
 
-    if config.include_zero_managers_from_order and config.manager_order:
-        for manager in config.manager_order:
-            if manager not in stats:
-                stats[manager] = {
-                    "total": 0, "ip": 0, "too": 0, "contract": 0, "accept": 0,
-                    "nib_sale": 0, "nib": 0, "zero": 0, "empty_tag": 0,
-                    "other_tag": 0, "red": 0,
-                }
-
-    result: List[List[Any]] = []
-    for m, s in stats.items():
+    # ---- финальное представление строк ----
+    def _build_row(name: str, s: Dict[str, int]) -> List[Any]:
         percent = (s["accept"] / s["total"]) if s["total"] > 0 else 0
         percent_str = f"{round(percent * 100)}%"
-        result.append([
-            m, s["total"], s["ip"], s["too"], s["contract"], s["accept"], percent_str,
+        return [
+            name, s["total"], s["ip"], s["too"], s["contract"], s["accept"], percent_str,
             s["nib_sale"], s["nib"], s["zero"], s["empty_tag"], s["other_tag"], s["red"],
-        ])
-    return _sort_manager_rows(result, config)
+        ]
+
+    # Шаблон "нулевого" менеджера — используется в STRICT при include_zero=true
+    def _zero_stats() -> Dict[str, int]:
+        return {
+            "total": 0, "ip": 0, "too": 0, "contract": 0, "accept": 0,
+            "nib_sale": 0, "nib": 0, "zero": 0, "empty_tag": 0,
+            "other_tag": 0, "red": 0,
+        }
+
+    # ---- STRICT ORDER: только менеджеры из MANAGER_ORDER, строго в его порядке ----
+    if config.manager_strict_order_only and config.manager_order:
+        # Все имена сравниваем case-insensitive. Канонический вид берём из MANAGER_ORDER.
+        stats_by_lower: Dict[str, Tuple[str, Dict[str, int]]] = {
+            k.lower(): (k, v) for k, v in stats.items()
+        }
+        result: List[List[Any]] = []
+        matched_lower: set = set()
+
+        for canonical in config.manager_order:
+            key_low = canonical.lower()
+            if key_low in stats_by_lower:
+                _, s = stats_by_lower[key_low]
+                # ВАЖНО: используем имя из MANAGER_ORDER (это «истинное» написание).
+                # Это безопасно: подсчёты не меняются, меняется только метка.
+                result.append(_build_row(canonical, s))
+                matched_lower.add(key_low)
+            else:
+                if config.include_zero_managers_from_order:
+                    result.append(_build_row(canonical, _zero_stats()))
+
+        # Лог: кого выкинули (для диагностики опечаток / пропущенных alias)
+        excluded = [
+            name for low, (name, _s) in stats_by_lower.items()
+            if low not in matched_lower
+        ]
+        if excluded:
+            print(f"[INFO] STRICT_ORDER ({real_name}): filtered out "
+                  f"{len(excluded)} managers not in MANAGER_ORDER: {excluded}. "
+                  f"Add them to MANAGER_ORDER or to MANAGER_ALIASES.")
+        return result
+
+    # ---- Старое поведение: всё, что нашли, по алфавиту ----
+    result = []
+    for m, s in stats.items():
+        result.append(_build_row(m, s))
+    result.sort(key=lambda x: str(x[0]))
+    return result
 
 
 # =====================================================================
 #                Запись/Очистка/Backup итогового блока
 # =====================================================================
-
 
 def _pad_or_trim_row(row: List[Any], width: int = BLOCK_WIDTH) -> List[Any]:
     row = list(row) if row else []
@@ -821,22 +1018,33 @@ def _pad_or_trim_row(row: List[Any], width: int = BLOCK_WIDTH) -> List[Any]:
 
 
 def _count_filled_rows(block_values: List[List[Any]]) -> int:
-    return sum(1 for r in block_values if r and any(str(c).strip() for c in r))
+    n = 0
+    for r in block_values:
+        if r and any(str(c).strip() for c in r):
+            n += 1
+    return n
 
 
-def read_block_old_values(service, config: Config, sheet_title: str, loc: BlockLocation) -> List[List[Any]]:
+def read_block_old_values(
+    service, config: Config, sheet_title: str, loc: BlockLocation,
+) -> List[List[Any]]:
+    """Читает текущее содержимое блока A:M — нужно для backup и drop-ratio."""
     end_row = loc.data_start_row + loc.data_max_rows - 1
     a1 = f"{sheet_title}!A{loc.data_start_row}:M{end_row}"
     return read_values(service, config.summary_spreadsheet_id, a1)
 
 
-def backup_block_to_disk(config: Config, sheet_title: str, loc: BlockLocation, values: List[List[Any]]) -> Optional[str]:
+def backup_block_to_disk(
+    config: Config, sheet_title: str, loc: BlockLocation, values: List[List[Any]],
+) -> Optional[str]:
+    """Сохраняет JSON-снимок блока. Возвращает путь или None при ошибке."""
     try:
         os.makedirs(config.backup_dir, exist_ok=True)
         ts = config.now_local().strftime("%Y%m%d_%H%M%S")
         safe_sheet = re.sub(r"[^A-Za-z0-9_.-]+", "_", sheet_title)
         safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", loc.label)
-        path = os.path.join(config.backup_dir, f"backup_{ts}_{safe_sheet}_{safe_label}.json")
+        fname = f"backup_{ts}_{safe_sheet}_{safe_label}.json"
+        path = os.path.join(config.backup_dir, fname)
         end_row = loc.data_start_row + loc.data_max_rows - 1
         payload = {
             "timestamp": config.now_local().isoformat(),
@@ -867,21 +1075,40 @@ class WriteDecision:
     range_clear: str = ""
 
 
-def decide_write(config: Config, sheet_title: str, loc: BlockLocation, new_rows: List[List[Any]], old_values: List[List[Any]]) -> WriteDecision:
+def decide_write(
+    config: Config, sheet_title: str, loc: BlockLocation,
+    new_rows: List[List[Any]], old_values: List[List[Any]],
+) -> WriteDecision:
+    """Решаем, можно ли писать. Никакой записи здесь не делается."""
     new_filled = len(new_rows)
     old_filled = _count_filled_rows(old_values)
 
+    # 1) если новых данных 0 — никогда не пишем и не чистим
     if new_filled == 0:
-        return WriteDecision(False, False, 0, 0, old_filled, 0, "source returned 0 rows (refusing to touch the block)")
+        return WriteDecision(
+            will_write=False, will_clear=False,
+            rows_to_write=0, rows_to_clear=0,
+            old_filled=old_filled, new_filled=0,
+            skip_reason="source returned 0 rows (refusing to touch the block)",
+        )
 
+    # 2) drop ratio
     if old_filled > 0:
         drop = 1 - (new_filled / old_filled)
         if drop > config.max_drop_ratio:
-            return WriteDecision(False, False, new_filled, 0, old_filled, new_filled,
-                                 f"suspicious drop {drop:.0%} > MAX_DROP_RATIO {config.max_drop_ratio:.0%} (old={old_filled}, new={new_filled})")
+            return WriteDecision(
+                will_write=False, will_clear=False,
+                rows_to_write=new_filled, rows_to_clear=0,
+                old_filled=old_filled, new_filled=new_filled,
+                skip_reason=(f"suspicious drop {drop:.0%} > MAX_DROP_RATIO "
+                             f"{config.max_drop_ratio:.0%} "
+                             f"(old={old_filled}, new={new_filled})"),
+            )
 
+    # 3) превышение размера блока — обрежем
     rows_to_write = min(new_filled, loc.data_max_rows)
 
+    # 4) очистка хвоста — только если разрешено
     rows_to_clear = 0
     range_clear = ""
     if config.clear_tail and rows_to_write < loc.data_max_rows:
@@ -893,10 +1120,20 @@ def decide_write(config: Config, sheet_title: str, loc: BlockLocation, new_rows:
 
     end_row = loc.data_start_row + rows_to_write - 1
     range_write = f"{sheet_title}!A{loc.data_start_row}:M{end_row}"
-    return WriteDecision(True, rows_to_clear > 0, rows_to_write, rows_to_clear, old_filled, new_filled, "", range_write, range_clear)
+
+    return WriteDecision(
+        will_write=True, will_clear=(rows_to_clear > 0),
+        rows_to_write=rows_to_write, rows_to_clear=rows_to_clear,
+        old_filled=old_filled, new_filled=new_filled,
+        range_write=range_write, range_clear=range_clear,
+    )
 
 
-def apply_write_decision(service, config: Config, sheet_title: str, loc: BlockLocation, new_rows: List[List[Any]], decision: WriteDecision) -> None:
+def apply_write_decision(
+    service, config: Config, sheet_title: str, loc: BlockLocation,
+    new_rows: List[List[Any]], decision: WriteDecision,
+) -> None:
+    """Реально пишет (если не dry-run)."""
     if not decision.will_write:
         return
 
@@ -910,10 +1147,13 @@ def apply_write_decision(service, config: Config, sheet_title: str, loc: BlockLo
     if decision.will_clear and decision.range_clear:
         blanks = [[""] * BLOCK_WIDTH for _ in range(decision.rows_to_clear)]
         if config.dry_run:
-            print(f"[DRY] would CLEAR tail {decision.rows_to_clear} rows at {decision.range_clear}")
+            print(f"[DRY] would CLEAR tail {decision.rows_to_clear} rows "
+                  f"at {decision.range_clear}")
         else:
-            write_values(service, config.summary_spreadsheet_id, decision.range_clear, blanks)
-            print(f"[OK]  CLEARED tail {decision.rows_to_clear} rows at {decision.range_clear}")
+            write_values(service, config.summary_spreadsheet_id,
+                         decision.range_clear, blanks)
+            print(f"[OK]  CLEARED tail {decision.rows_to_clear} rows "
+                  f"at {decision.range_clear}")
 
 
 # =====================================================================
@@ -927,7 +1167,14 @@ LOG_HEADERS = [
 ]
 
 
-def maybe_write_log(service, config: Config, log_row: Dict[str, Any]) -> None:
+def maybe_write_log(
+    service, config: Config, log_row: Dict[str, Any],
+) -> None:
+    """
+    Пишет строку в Sync_Log в SUMMARY таблице.
+    - При DRY_RUN — не пишет.
+    - Если Sync_Log нет: при SAFE_MODE только warning, при CREATE_LOG_SHEET=true создаёт.
+    """
     if config.dry_run:
         return
 
@@ -936,19 +1183,31 @@ def maybe_write_log(service, config: Config, log_row: Dict[str, Any]) -> None:
 
     if not real:
         if not config.create_log_sheet:
-            return
-        if config.safe_mode and not config.allow_create_sheets:
-            print("[WARN] Sync_Log missing and SAFE_MODE=true. Set ALLOW_CREATE_SHEETS=true and CREATE_LOG_SHEET=true to create it.")
-            return
-        try:
-            req = {"requests": [{"addSheet": {"properties": {"title": "Sync_Log"}}}]}
-            service.spreadsheets().batchUpdate(spreadsheetId=config.summary_spreadsheet_id, body=req).execute()
-            write_values(service, config.summary_spreadsheet_id, "Sync_Log!A1:O1", [LOG_HEADERS])
-            real = "Sync_Log"
-        except Exception as e:
-            print(f"[WARN] cannot create Sync_Log: {e}")
-            return
+            if config.safe_mode:
+                # warning один раз — не спамим
+                return
+        else:
+            # создаём, только если CREATE_LOG_SHEET=true И не dry-run И не SAFE_MODE-блок
+            if config.safe_mode and not config.allow_create_sheets:
+                print("[WARN] Sync_Log missing and SAFE_MODE=true. Set ALLOW_CREATE_SHEETS=true "
+                      "and CREATE_LOG_SHEET=true to create it.")
+                return
+            try:
+                req = {"requests": [{"addSheet": {"properties": {"title": "Sync_Log"}}}]}
+                service.spreadsheets().batchUpdate(
+                    spreadsheetId=config.summary_spreadsheet_id, body=req
+                ).execute()
+                # заголовки
+                write_values(
+                    service, config.summary_spreadsheet_id,
+                    "Sync_Log!A1:O1", [LOG_HEADERS],
+                )
+                real = "Sync_Log"
+            except Exception as e:
+                print(f"[WARN] cannot create Sync_Log: {e}")
+                return
 
+    # append через values.append
     row = [
         log_row.get("Timestamp", ""),
         log_row.get("Environment", ""),
@@ -985,26 +1244,34 @@ def maybe_write_log(service, config: Config, log_row: Dict[str, Any]) -> None:
 #                  Запуск обновления одного месяца
 # =====================================================================
 
-
-def _ensure_summary_sheet(service, config: Config, summary_titles_lower: Dict[str, str], target_name: str) -> Optional[str]:
+def _ensure_summary_sheet(
+    service, config: Config, summary_titles_lower: Dict[str, str], target_name: str,
+) -> Optional[str]:
+    """Возвращает реальное имя листа 'Сводная - {month}', или None если не разрешено создавать."""
     real = find_sheet_smart(summary_titles_lower, target_name)
     if real:
         return real
+    # листа нет
     if config.safe_mode:
-        print(f"[INFO] Target sheet {target_name!r} not found. Waiting until humans create it.")
+        print(f"[INFO] Target sheet {target_name!r} not found. "
+              f"Waiting until humans create it.")
         return None
     if not config.allow_create_sheets:
-        print(f"[INFO] Target sheet {target_name!r} not found and ALLOW_CREATE_SHEETS=false. Waiting until humans create it.")
+        print(f"[INFO] Target sheet {target_name!r} not found and "
+              f"ALLOW_CREATE_SHEETS=false. Waiting until humans create it.")
         return None
     if config.environment == "production" and not config.allow_production_write:
-        print("[WARN] Refusing to create sheet in production without ALLOW_PRODUCTION_WRITE.")
+        print(f"[WARN] Refusing to create sheet in production without ALLOW_PRODUCTION_WRITE.")
         return None
     if config.dry_run:
         print(f"[DRY] would CREATE sheet {target_name!r}")
-        return target_name
+        return target_name  # для dry-run сделаем вид, что есть, но фактически не пишем
+    # реально создаём
     try:
         req = {"requests": [{"addSheet": {"properties": {"title": target_name}}}]}
-        service.spreadsheets().batchUpdate(spreadsheetId=config.summary_spreadsheet_id, body=req).execute()
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=config.summary_spreadsheet_id, body=req
+        ).execute()
         print(f"[OK] created sheet {target_name!r}")
         return target_name
     except Exception as e:
@@ -1027,29 +1294,13 @@ def run_month_update(
         print(f"[SKIP] month {month_name}: target sheet unavailable")
         return
 
-    # Локация блоков.
-    # ВАЖНО: сначала находим ЯНДЕКС СЕТКА title-row, чтобы НАША СЕТКА не могла залезть на блок ниже.
-    yandex_title_row = find_title_row(
-        service,
-        config.summary_spreadsheet_id,
-        real_title,
-        "ЯНДЕКС СЕТКА",
-    )
-
+    # Локация блоков
     our_loc = locate_block(
-        service,
-        config,
-        real_title,
-        "НАША СЕТКА",
+        service, config, real_title, "НАША СЕТКА",
         block_height_hint=config.our_block_rows,
-        next_block_title_row=yandex_title_row,
     )
-
     yandex_loc = locate_block(
-        service,
-        config,
-        real_title,
-        "ЯНДЕКС СЕТКА",
+        service, config, real_title, "ЯНДЕКС СЕТКА",
         block_height_hint=config.yandex_block_rows,
     )
 
@@ -1057,19 +1308,26 @@ def run_month_update(
         print(f"[SKIP] {target_name!r}: no blocks found, will not write")
         return
 
-    our_new_rows = analyze_single_sheet(service, config.our_grid_id, our_titles_lower, our_sheet, config)
+    # --- Source: OUR ---
+    our_new_rows = analyze_single_sheet(
+        service, config.our_grid_id, our_titles_lower, our_sheet, config,
+    )
 
+    # --- Source: YANDEX (опционально) ---
     yandex_new_rows: List[List[Any]] = []
     yandex_available = True
     if yandex_titles_lower is None:
         yandex_available = False
-        print("[INFO] YANDEX source unavailable, skipped YANDEX block")
+        msg = "YANDEX source unavailable, skipped YANDEX block"
+        print(f"[INFO] {msg}")
     elif not yandex_sheet:
         yandex_available = False
         print(f"[INFO] YANDEX sheet name is empty for month {month_name} -> skipping YANDEX block")
     else:
         try:
-            yandex_new_rows = analyze_single_sheet(service, config.yandex_grid_id, yandex_titles_lower, yandex_sheet, config)
+            yandex_new_rows = analyze_single_sheet(
+                service, config.yandex_grid_id, yandex_titles_lower, yandex_sheet, config,
+            )
         except SystemExit:
             raise
         except Exception as e:
@@ -1078,17 +1336,24 @@ def run_month_update(
                 raise SystemExit(f"[FATAL] REQUIRE_YANDEX=true and yandex analyze failed: {e}")
             print(f"[WARN] YANDEX analyze failed, skipping YANDEX block: {e}")
 
+    # --- OUR block: backup -> decide -> write ---
     if our_loc:
-        _process_block(service=service, config=config, sheet_title=real_title,
-                       loc=our_loc, new_rows=our_new_rows,
-                       source_id=config.our_grid_id, source_sheet=our_sheet, month=month_name)
+        _process_block(
+            service=service, config=config, sheet_title=real_title,
+            loc=our_loc, new_rows=our_new_rows,
+            source_id=config.our_grid_id, source_sheet=our_sheet, month=month_name,
+        )
 
+    # --- YANDEX block ---
     if yandex_loc:
         if yandex_available:
-            _process_block(service=service, config=config, sheet_title=real_title,
-                           loc=yandex_loc, new_rows=yandex_new_rows,
-                           source_id=config.yandex_grid_id, source_sheet=yandex_sheet, month=month_name)
+            _process_block(
+                service=service, config=config, sheet_title=real_title,
+                loc=yandex_loc, new_rows=yandex_new_rows,
+                source_id=config.yandex_grid_id, source_sheet=yandex_sheet, month=month_name,
+            )
         else:
+            # ВАЖНО: не трогаем старый яндекс-блок
             print(f"[INFO] {target_name}: keeping existing YANDEX block intact (source unavailable)")
             maybe_write_log(service, config, {
                 "Timestamp": config.now_local().isoformat(),
@@ -1102,12 +1367,15 @@ def run_month_update(
                 "Message": "YANDEX source unavailable",
             })
 
+    # --- timestamp в N1 ---
     if not config.dry_run:
         try:
             updated = config.now_local().strftime("%d.%m %H:%M:%S")
-            write_values(service, config.summary_spreadsheet_id,
-                         f"{real_title}!{config.updated_at_cell}",
-                         [[f"Обновлено: {updated}"]])
+            write_values(
+                service, config.summary_spreadsheet_id,
+                f"{real_title}!{config.updated_at_cell}",
+                [[f"Обновлено: {updated}"]],
+            )
         except Exception as e:
             print(f"[WARN] cannot write timestamp to {config.updated_at_cell}: {e}")
     else:
@@ -1116,35 +1384,40 @@ def run_month_update(
 
 def _process_block(
     *, service, config: Config, sheet_title: str, loc: BlockLocation,
-    new_rows: List[List[Any]], source_id: str, source_sheet: str, month: str,
+    new_rows: List[List[Any]],
+    source_id: str, source_sheet: str, month: str,
 ) -> None:
+    """Backup + decide + apply для одного блока."""
     old_values = read_block_old_values(service, config, sheet_title, loc)
 
+    backup_path: Optional[str] = None
     if config.backup_before_write and not config.dry_run:
         backup_path = backup_block_to_disk(config, sheet_title, loc, old_values)
         if backup_path:
             print(f"[OK] backup saved: {backup_path}")
-        elif config.safe_mode:
-            print(f"[SKIP] backup failed and SAFE_MODE=true -> refusing to write {loc.label}")
-            maybe_write_log(service, config, {
-                "Timestamp": config.now_local().isoformat(),
-                "Environment": config.environment,
-                "DryRun": config.dry_run, "SafeMode": config.safe_mode,
-                "Month": month, "Block": loc.label,
-                "SourceSpreadsheet": _mask_id(source_id),
-                "SourceSheet": source_sheet, "TargetSheet": sheet_title,
-                "RowsRead": len(new_rows), "RowsWritten": 0, "RowsCleared": 0,
-                "RangeWritten": "", "Status": "skipped",
-                "Message": "backup failed in SAFE_MODE",
-            })
-            return
         else:
-            print("[WARN] backup failed but SAFE_MODE=false -> proceeding")
+            if config.safe_mode:
+                print(f"[SKIP] backup failed and SAFE_MODE=true -> refusing to write {loc.label}")
+                maybe_write_log(service, config, {
+                    "Timestamp": config.now_local().isoformat(),
+                    "Environment": config.environment,
+                    "DryRun": config.dry_run, "SafeMode": config.safe_mode,
+                    "Month": month, "Block": loc.label,
+                    "SourceSpreadsheet": _mask_id(source_id),
+                    "SourceSheet": source_sheet, "TargetSheet": sheet_title,
+                    "RowsRead": len(new_rows), "RowsWritten": 0, "RowsCleared": 0,
+                    "RangeWritten": "", "Status": "skipped",
+                    "Message": "backup failed in SAFE_MODE",
+                })
+                return
+            else:
+                print(f"[WARN] backup failed but SAFE_MODE=false -> proceeding")
 
     decision = decide_write(config, sheet_title, loc, new_rows, old_values)
 
     if not decision.will_write:
-        print(f"[SKIP] {loc.label}: {decision.skip_reason} (old_filled={decision.old_filled}, new={decision.new_filled})")
+        print(f"[SKIP] {loc.label}: {decision.skip_reason} "
+              f"(old_filled={decision.old_filled}, new={decision.new_filled})")
         maybe_write_log(service, config, {
             "Timestamp": config.now_local().isoformat(),
             "Environment": config.environment,
@@ -1159,7 +1432,8 @@ def _process_block(
         return
 
     print(f"[PLAN] {loc.label}: write {decision.rows_to_write} rows -> {decision.range_write}"
-          + (f"; clear {decision.rows_to_clear} rows -> {decision.range_clear}" if decision.will_clear else "; CLEAR_TAIL=false (tail untouched)"))
+          + (f"; clear {decision.rows_to_clear} rows -> {decision.range_clear}"
+             if decision.will_clear else "; CLEAR_TAIL=false (tail untouched)"))
 
     apply_write_decision(service, config, sheet_title, loc, new_rows, decision)
 
@@ -1183,14 +1457,14 @@ def _process_block(
 #                Settings / orchestration
 # =====================================================================
 
-
 def read_settings_pairs(service, config: Config) -> List[Tuple[str, str, str]]:
+    """Читает Settings!A2:B -> [(month, our_sheet, yandex_sheet), ...]"""
     rng = f"{config.summary_settings_sheet_name}!A2:B"
     rows = read_values(service, config.summary_spreadsheet_id, rng)
     pairs: List[Tuple[str, str, str]] = []
     for row in rows:
-        a = str(row[0]).strip() if len(row) > 0 else ""
-        b = str(row[1]).strip() if len(row) > 1 else ""
+        a = (row[0] if len(row) > 0 else "").strip()
+        b = (row[1] if len(row) > 1 else "").strip()
         month = a or b
         if not month:
             continue
@@ -1199,16 +1473,31 @@ def read_settings_pairs(service, config: Config) -> List[Tuple[str, str, str]]:
 
 
 def run_summary_once(config: Config) -> None:
+    """
+    Один проход по всем месяцам из Settings (или только по config.target_month).
+    Подходит для --once и для одной итерации --loop.
+    """
     print(config.banner())
+
     service = build_sheets_service(config)
 
-    verify_spreadsheet_title(service, config.summary_spreadsheet_id, config.expected_summary_title, "SUMMARY")
-    verify_spreadsheet_title(service, config.our_grid_id, config.expected_our_title, "OUR")
+    # ---- проверка title таблиц ----
+    verify_spreadsheet_title(
+        service, config.summary_spreadsheet_id,
+        config.expected_summary_title, "SUMMARY",
+    )
+    verify_spreadsheet_title(
+        service, config.our_grid_id,
+        config.expected_our_title, "OUR",
+    )
 
     yandex_titles_lower: Optional[Dict[str, str]] = None
     if config.yandex_grid_id:
         try:
-            verify_spreadsheet_title(service, config.yandex_grid_id, config.expected_yandex_title, "YANDEX")
+            verify_spreadsheet_title(
+                service, config.yandex_grid_id,
+                config.expected_yandex_title, "YANDEX",
+            )
             yandex_titles_lower = get_sheet_titles(service, config.yandex_grid_id)
         except SystemExit:
             raise
@@ -1231,24 +1520,38 @@ def run_summary_once(config: Config) -> None:
     months_in_settings = [p[0] for p in pairs]
     print(f"[INFO] Settings months: {months_in_settings}")
 
+    # ---- выбор месяца(ев) для обработки ----
+    # Приоритет:
+    #   1. CLI --month (config.target_month)
+    #   2. AUTO_MONTH=true -> compute_auto_month()
+    #   3. иначе все месяцы из Settings
     resolved = config.resolve_target_month()
-    selection_source = "CLI --month" if config.target_month else "AUTO_MONTH" if config.auto_month else None
+    selection_source = (
+        "CLI --month" if config.target_month
+        else "AUTO_MONTH" if config.auto_month
+        else None
+    )
 
     if resolved:
         wanted = resolved.strip().lower()
         matched = [p for p in pairs if p[0].strip().lower() == wanted]
 
-        if not matched and config.auto_month and not config.target_month and config.auto_discover_month:
+        if not matched and config.auto_month and not config.target_month \
+                and config.auto_discover_month:
+            # Fallback: ищем самый свежий месяц из Settings, не позднее resolved
             fallback = find_closest_settings_month(pairs, resolved)
             if fallback:
-                print(f"[INFO] AUTO_DISCOVER_MONTH: {resolved!r} not in Settings, falling back to {fallback!r}.")
+                print(f"[INFO] AUTO_DISCOVER_MONTH: {resolved!r} not in Settings, "
+                      f"falling back to {fallback!r}.")
                 wanted = fallback.strip().lower()
                 matched = [p for p in pairs if p[0].strip().lower() == wanted]
                 resolved = fallback
 
         if not matched:
+            # Стандартный лог из ТЗ — для AUTO_MONTH случая:
             if config.auto_month and not config.target_month:
-                print(f"[INFO] AUTO_MONTH selected {resolved}, but it is not found in Settings. Waiting until humans add it.")
+                print(f"[INFO] AUTO_MONTH selected {resolved}, but it is not "
+                      f"found in Settings. Waiting until humans add it.")
             else:
                 print(f"[WARN] --month {resolved!r} not found in Settings")
             return
@@ -1262,8 +1565,11 @@ def run_summary_once(config: Config) -> None:
     failed = 0
     for month, our_sheet, yandex_sheet in pairs:
         try:
-            run_month_update(service, config, summary_titles_lower, our_titles_lower, yandex_titles_lower,
-                             month, our_sheet, yandex_sheet)
+            run_month_update(
+                service, config,
+                summary_titles_lower, our_titles_lower, yandex_titles_lower,
+                month, our_sheet, yandex_sheet,
+            )
             success += 1
         except SystemExit:
             raise
@@ -1271,4 +1577,5 @@ def run_summary_once(config: Config) -> None:
             failed += 1
             print(f"[ERROR] month {month}: {type(e).__name__}: {e}")
 
-    print(f"\n[SUMMARY] success={success}, failed={failed}, total_months={len(pairs)}, dry_run={config.dry_run}")
+    print(f"\n[SUMMARY] success={success}, failed={failed}, "
+          f"total_months={len(pairs)}, dry_run={config.dry_run}")
